@@ -49,9 +49,13 @@ import pandas as pd
 # --------------------------------------------------------------------------- #
 
 PARAMS = {
-    "vol_days":    250,     # lookback for the volatility estimate
-    "tilt_size":   0.06,    # how far a 1-sigma signal moves a weight
-    "trade_speed": 0.10,    # fraction of the gap to yesterday we close per day
+    "trend_fast": 63,
+    "trend_mid": 126,
+    "trend_slow": 252,
+    "vol_days": 126,
+    "active_target": 0.18,
+    "trade_speed": 0.25,
+    "no_trade": 0.002,
 }
 
 # The rules, restated locally so this file reads on its own.
@@ -89,19 +93,125 @@ GOLD_CAP = 0.10
 # --------------------------------------------------------------------------- #
 
 
+def _clip(x, lo=-3.0, hi=3.0):
+    return float(np.clip(x, lo, hi))
+
+
+def _price_momentum(series, horizon, daily_vol):
+    if len(series) <= horizon or not np.isfinite(daily_vol) or daily_vol <= 1e-12:
+        return 0.0
+    r = float(series.iloc[-1] / series.iloc[-1-horizon] - 1.0)
+    return _clip(r / (daily_vol * np.sqrt(horizon)))
+
+
+def _pct_momentum(series, horizon, lookback=252):
+    if len(series) <= horizon + 5:
+        return 0.0
+    r = float(series.iloc[-1] / series.iloc[-1-horizon] - 1.0)
+    d = series.astype(float).pct_change(fill_method=None).tail(lookback).dropna()
+    sd = float(d.std()) if len(d) else 0.0
+    return _clip(r / (sd * np.sqrt(horizon))) if sd > 1e-12 else 0.0
+
+
+def _change_score(series, horizon, lookback=252):
+    if len(series) <= horizon + 5:
+        return 0.0
+    delta = float(series.iloc[-1] - series.iloc[-1-horizon])
+    d = series.astype(float).diff().tail(lookback).dropna()
+    sd = float(d.std()) if len(d) else 0.0
+    return _clip(delta / (sd * np.sqrt(horizon))) if sd > 1e-12 else 0.0
+
+
+def _level_z(series, lookback=756):
+    x = series.astype(float).tail(lookback).dropna()
+    if len(x) < 60:
+        return 0.0
+    sd = float(x.std())
+    return _clip((float(x.iloc[-1]) - float(x.mean())) / sd) if sd > 1e-12 else 0.0
+
+
 def build_signal(hist, params) -> pd.Series:
-    """Score per asset. Positive means overweight, negative means underweight.
+    """Asset-specific tactical attractiveness score."""
+    assets = hist.assets
+    prices = hist.prices.reindex(columns=assets)
+    returns = hist.returns.reindex(columns=assets)
+    macro = hist.macro
 
-    Naive placeholder: inverse volatility. Lower-volatility assets score
-    higher. That is a statement about risk, not about return -- replace it.
-    """
+    fast = int(params["trend_fast"])
+    mid = int(params["trend_mid"])
+    slow = int(params["trend_slow"])
+    vol_days = int(params["vol_days"])
+
+    daily_vol = returns.tail(vol_days).std().replace(0.0, np.nan)
+
+    trend = pd.Series(0.0, index=assets)
+    for a in assets:
+        if a == "SA_CASH":
+            continue
+        trend[a] = np.mean([
+            _price_momentum(prices[a], fast, float(daily_vol.get(a, np.nan))),
+            _price_momentum(prices[a], mid, float(daily_vol.get(a, np.nan))),
+            _price_momentum(prices[a], slow, float(daily_vol.get(a, np.nan))),
+        ])
+
+    property_slow = np.mean([
+        _price_momentum(prices["SA_PROPERTY"], mid, float(daily_vol["SA_PROPERTY"])),
+        _price_momentum(prices["SA_PROPERTY"], slow, float(daily_vol["SA_PROPERTY"])),
+    ])
+
+    em = np.mean([_pct_momentum(macro["em_equity"], fast),
+                  _pct_momentum(macro["em_equity"], mid)])
+    fx = np.mean([_pct_momentum(macro["usdzar"], fast),
+                  _pct_momentum(macro["usdzar"], mid)])
+    dxy = np.mean([_pct_momentum(macro["dxy"], fast),
+                   _pct_momentum(macro["dxy"], mid)])
+    vix = _level_z(macro["vix"], 504)
+
+    # Positive = supportive for South African / EM risk assets.
+    risk_on = _clip((em - dxy - fx - vix) / 4.0)
+    global_risk = _clip((-dxy - vix) / 2.0)
+
+    sa_yield_move = np.mean([_change_score(macro["sa_10y"], fast),
+                             _change_score(macro["sa_10y"], mid)])
+    local_curve = _level_z(macro["sa_10y"] - macro["jibar_3m"], 756)
+    rate_score = _clip((-sa_yield_move + local_curve) / 2.0)
+
+    us_yield_move = np.mean([_change_score(macro["us_10y"], fast),
+                             _change_score(macro["us_10y"], mid)])
+    short_rate = _level_z(macro["jibar_3m"], 756)
+
+    score = pd.Series(0.0, index=assets)
+    score["SA_EQUITY"] = (trend["SA_EQUITY"] + risk_on) / 2.0
+    score["GLOBAL_EQUITY"] = (trend["GLOBAL_EQUITY"] + fx + global_risk) / 3.0
+    score["SA_BONDS"] = (trend["SA_BONDS"] + rate_score) / 2.0
+    score["SA_CASH"] = (-risk_on + short_rate) / 2.0
+    score["SA_PROPERTY"] = (property_slow + rate_score + trend["SA_EQUITY"]) / 3.0
+    score["GOLD"] = (trend["GOLD"] + fx - us_yield_move) / 3.0
+
+    return score.clip(-3.0, 3.0)
+
+
+def _active_from_signal(signal: pd.Series, hist, params) -> pd.Series:
+    """Convert scores to zero-sum active weights, with volatility used only for sizing."""
+    assets = hist.assets
+    score = signal.reindex(assets).astype(float).fillna(0.0)
+
     vol = hist.returns.tail(int(params["vol_days"])).std() * np.sqrt(252)
-    score = (1.0 / vol.replace(0.0, np.nan)).reindex(hist.assets).fillna(0.0)
+    risk_vol = vol.drop(labels=["SA_CASH"], errors="ignore").replace(0.0, np.nan)
+    ref_vol = float(risk_vol.median()) if len(risk_vol.dropna()) else 1.0
 
-    # standardise so the signal scale is stable through time
-    if score.std() > 0:
-        score = (score - score.mean()) / score.std()
-    return score
+    scale = pd.Series(1.0, index=assets)
+    for a in assets:
+        if a != "SA_CASH" and np.isfinite(vol.get(a, np.nan)) and vol[a] > 1e-12:
+            scale[a] = np.sqrt(ref_vol / float(vol[a]))
+
+    q = score * scale
+    q = q - q.mean()
+    total = float(q.abs().sum())
+    if total <= 1e-12:
+        return pd.Series(0.0, index=assets)
+
+    return float(params["active_target"]) * q / total
 
 
 def make_legal(weights: pd.Series, hist) -> pd.Series:
@@ -157,19 +267,33 @@ def generate_weights(hist, prev_weights, params):
     """Return the six portfolio weights to hold on hist.date."""
     bm = hist.benchmark
 
-    # not enough history to estimate anything: sit on the benchmark
-    if len(hist.returns) < 260:
+    if len(hist.returns) < int(params["trend_slow"]) + 10:
         return bm.to_dict()
 
-    # 1. signal -> target weights around the benchmark
     signal = build_signal(hist, params)
-    target = make_legal(bm + float(params["tilt_size"]) * signal, hist)
+    target = make_legal(bm + _active_from_signal(signal, hist, params), hist)
 
-    # 2. trade gradually toward the target rather than jumping to it
-    prev = prev_weights.reindex(hist.assets)
-    w = prev + float(params["trade_speed"]) * (target - prev)
+    prev = prev_weights.reindex(hist.assets).astype(float)
+    gap = target - prev
 
-    return make_legal(w, hist).to_dict()
+    costs = pd.Series({
+        "SA_EQUITY": 15.0,
+        "GLOBAL_EQUITY": 20.0,
+        "SA_BONDS": 8.0,
+        "SA_CASH": 1.0,
+        "SA_PROPERTY": 35.0,
+        "GOLD": 25.0,
+    }).reindex(hist.assets)
+
+    # Wider no-trade bands and slower trading for expensive assets.
+    threshold = float(params["no_trade"]) * (0.5 + costs / costs.max())
+    gap = gap.where(gap.abs() >= threshold, 0.0)
+
+    speed = float(params["trade_speed"]) * np.sqrt(15.0 / costs)
+    speed = speed.clip(lower=0.10, upper=0.60)
+
+    weights = prev + speed * gap
+    return make_legal(weights, hist).to_dict()
 
 
 # <<--------------------- YOUR CODE GOES ABOVE THIS LINE --------------------->>
